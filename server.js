@@ -57,6 +57,7 @@ function verifySignature(rawBody, headerSig) {
 
 // Basic in-memory handoff flags (replace with Redis/DB in prod HA)
 const handoff = new Map(); // waId -> boolean
+const conversationHistory = new Map(); // waId -> string[]
 
 const handoffRegex = new RegExp(
   HANDOFF_KEYWORDS.split(",").map(s => s.trim()).filter(Boolean).join("|"),
@@ -161,7 +162,6 @@ app.post("/wa", async (req, res) => {
 
   // Fan-out raw payload to 3CX + Chatwoot (non-blocking)
   Promise.allSettled([
-    forwardRawJSON(THREE_CX_WEBHOOK_URL, raw, {}),
     forwardRawJSON(
       CHATWOOT_WEBHOOK_URL,
       raw,
@@ -185,19 +185,41 @@ app.post("/wa", async (req, res) => {
     const text = (m.text?.body || "").trim();
     if (!waId || !text) continue;
 
+    // Store user message
+    const history = conversationHistory.get(waId) || [];
+    history.push(`User: ${text}`);
+    conversationHistory.set(waId, history);
+
     // Handoff intent?
     if (handoffRegex.test(text)) {
       handoff.set(waId, true);
       await sendWaText(waId, "Okay — connecting you with a human.");
+
+      const history = conversationHistory.get(waId) || [];
+      const transcript = history.join('\n');
       const summary = await getAISummary(waId);
-      await sendWaText(waId, `Summary so far:\n${summary}`);
+
+      const threeCxPayload = {
+          from: waId,
+          transcript: transcript,
+          summary: summary
+      };
+      const threeCxBody = Buffer.from(JSON.stringify(threeCxPayload));
+      await forwardRawJSON(THREE_CX_WEBHOOK_URL, threeCxBody, {});
+
       continue;
     }
 
     // AI control path
     if (!handoff.get(waId)) {
       const reply = await getAIReply({ waId, text });
-      if (reply) await sendWaText(waId, reply);
+      if (reply) {
+        await sendWaText(waId, reply);
+        // Store AI message
+        const history = conversationHistory.get(waId) || [];
+        history.push(`AI: ${reply}`);
+        conversationHistory.set(waId, history);
+      }
     }
   }
 });
