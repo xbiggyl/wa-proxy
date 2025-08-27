@@ -3,20 +3,19 @@ import crypto from "crypto";
 import fetch from "node-fetch";
 import bodyParser from "body-parser";
 
+// These are the environment variables the app uses.
+// See .env.example for more details.
 const {
   PORT = 3000,
   VERIFY_TOKEN,
   META_APP_SECRET,
   META_PERM_TOKEN,
   META_PHONE_NUMBER_ID,
-  THREE_CX_WEBHOOK_URL,
   CHATWOOT_WEBHOOK_URL,
   CHATWOOT_WEBHOOK_TOKEN,
   OPENAI_ENDPOINT,
-  OPENAI_SUMMARY_ENDPOINT,
   N8N_BASIC_USER,
   N8N_BASIC_PASS,
-  HANDOFF_KEYWORDS = "human,agent,representative,support,help",
 } = process.env;
 
 if (!VERIFY_TOKEN || !META_APP_SECRET || !META_PERM_TOKEN || !META_PHONE_NUMBER_ID || !OPENAI_ENDPOINT) {
@@ -55,15 +54,13 @@ function verifySignature(rawBody, headerSig) {
   }
 }
 
-// Basic in-memory handoff flags (replace with Redis/DB in prod HA)
-const handoff = new Map(); // waId -> boolean
-
-const handoffRegex = new RegExp(
-  HANDOFF_KEYWORDS.split(",").map(s => s.trim()).filter(Boolean).join("|"),
-  "i"
-);
-
 // Helpers
+
+/**
+ * If N8N_BASIC_USER and N8N_BASIC_PASS are set, returns an object with an
+ * Authorization header for Basic Auth. Otherwise, returns an empty object.
+ * @returns {object}
+ */
 function maybeAuthHeader() {
   if (N8N_BASIC_USER && N8N_BASIC_PASS) {
     const token = Buffer.from(`${N8N_BASIC_USER}:${N8N_BASIC_PASS}`).toString("base64");
@@ -126,26 +123,6 @@ async function getAIReply({ waId, text }) {
   }
 }
 
-async function getAISummary(waId) {
-  if (!OPENAI_SUMMARY_ENDPOINT) return "Summary not available.";
-  try {
-    const r = await fetch(OPENAI_SUMMARY_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...maybeAuthHeader() },
-      body: JSON.stringify({ waId })
-    });
-    const txt = await r.text();
-    if (!r.ok) {
-      console.error("AI summary error:", r.status, r.statusText, txt.slice(0,300));
-      return "Summary not available.";
-    }
-    const data = JSON.parse(txt);
-    return data.summary || "Summary not available.";
-  } catch (e) {
-    console.error("AI summary exception:", e.message);
-    return "Summary not available.";
-  }
-}
 
 // Main webhook
 app.post("/wa", async (req, res) => {
@@ -159,53 +136,50 @@ app.post("/wa", async (req, res) => {
   // ACK immediately
   res.sendStatus(200);
 
-  // Fan-out raw payload to 3CX + Chatwoot (non-blocking)
-  Promise.allSettled([
-    forwardRawJSON(THREE_CX_WEBHOOK_URL, raw, {}),
-    forwardRawJSON(
-      CHATWOOT_WEBHOOK_URL,
-      raw,
-      CHATWOOT_WEBHOOK_TOKEN ? { "X-Chatwoot-Webhook-Token": CHATWOOT_WEBHOOK_TOKEN } : {}
-    ),
-  ]).catch(() => {});
+  // Forward the raw payload to Chatwoot if a webhook URL is configured.
+  // This is done in a non-blocking way.
+  if (CHATWOOT_WEBHOOK_URL) {
+    const headers = CHATWOOT_WEBHOOK_TOKEN
+      ? { "X-Chatwoot-Webhook-Token": CHATWOOT_WEBHOOK_TOKEN }
+      : {};
+    forwardRawJSON(CHATWOOT_WEBHOOK_URL, raw, headers).catch(() => {});
+  }
 
-  // Parse after forwarding
+  // The N8N workflow is now responsible for all business logic, including
+  // handoff to 3CX. The proxy's job is just to route messages.
+
+  // Parse the webhook payload from Meta.
   let payload;
   try {
     payload = JSON.parse(raw.toString("utf8"));
   } catch (e) {
     console.error("JSON parse error:", e.message);
-    return;
+    return; // Stop processing if payload is invalid
   }
 
+  // Extract messages from the payload.
   const messages = payload?.entry?.[0]?.changes?.[0]?.value?.messages || [];
+
+  // Process each message.
   for (const m of messages) {
-    if (m.type !== "text") continue; // extend for media if needed
+    // We only handle text messages for now.
+    if (m.type !== "text") continue;
+
     const waId = m.from;
     const text = (m.text?.body || "").trim();
     if (!waId || !text) continue;
 
-    // Handoff intent?
-    if (handoffRegex.test(text)) {
-      handoff.set(waId, true);
-      await sendWaText(waId, "Okay — connecting you with a human.");
-      const summary = await getAISummary(waId);
-      await sendWaText(waId, `Summary so far:\n${summary}`);
-      continue;
-    }
+    // Get a reply from the N8N workflow.
+    const reply = await getAIReply({ waId, text });
 
-    // AI control path
-    if (!handoff.get(waId)) {
-      const reply = await getAIReply({ waId, text });
-      if (reply) await sendWaText(waId, reply);
+    // If the workflow returns a reply, send it back to the user.
+    if (reply) {
+      await sendWaText(waId, reply);
     }
   }
 });
 
 app.listen(Number(PORT), () => {
   console.log(`WA proxy listening on :${PORT}`);
-  console.log("Forwarding enabled:", {
-    to3cx: !!THREE_CX_WEBHOOK_URL,
-    toChatwoot: !!CHATWOOT_WEBHOOK_URL
-  });
+  console.log("Forwarding to Chatwoot enabled:", !!CHATWOOT_WEBHOOK_URL);
 });
